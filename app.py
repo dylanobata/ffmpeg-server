@@ -133,52 +133,138 @@ class VideoProcessor:
                 raise HTTPException(status_code=500, detail=f"FFprobe error: {e.stderr.decode()}")
 
     @staticmethod
-    async def combine_frames_to_video(zip_file: UploadFile, fps: int) -> bytes:
-        logger.info(f"Starting combine_frames_to_video with zip file: {zip_file.filename}, fps: {fps}")
-        
+    async def combine_frames_to_video(frames: List[UploadFile], fps: int) -> bytes:
         with tempfile.TemporaryDirectory() as temp_dir:
-            logger.info(f"Created temporary directory: {temp_dir}")
-            
-            # Read and extract zip file
-            zip_content = await zip_file.read()
-            with zipfile.ZipFile(BytesIO(zip_content)) as zip_ref:
-                # Get list of image files and sort them
-                image_files = [f for f in zip_ref.namelist() if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                image_files.sort()  # Ensure frames are in order
-                
-                logger.info(f"Found {len(image_files)} image files in zip")
-                
-                # Extract all images
-                zip_ref.extractall(temp_dir)
+            # Save all frames
+            for i, frame in enumerate(frames):
+                frame_path = os.path.join(temp_dir, f"frame_{str(i).zfill(6)}.jpg")
+                with open(frame_path, "wb") as f:
+                    f.write(await frame.read())
             
             output_path = os.path.join(temp_dir, "output.mp4")
             
             try:
-                logger.info(f"Running FFmpeg command with fps={fps}")
-                result = subprocess.run([
+                subprocess.run([
                     "ffmpeg",
                     "-framerate", str(fps),
-                    "-pattern_type", "glob",
-                    "-i", os.path.join(temp_dir, "*.jpg"),  # Adjust if you need to support other formats
+                    "-i", os.path.join(temp_dir, "frame_%06d.jpg"),
                     "-c:v", "libx264",
+                    "-preset", "slow",
+                    "-crf", "18",
                     "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart",
+                    "-tune", "film",
                     output_path
-                ], check=True, capture_output=True, text=True)
-                
-                logger.info("FFmpeg command completed successfully")
+                ], check=True, capture_output=True)
                 
                 with open(output_path, "rb") as f:
-                    content = f.read()
-                    logger.info(f"Output video size: {len(content)} bytes")
-                    return content
+                    return f.read()
             except subprocess.CalledProcessError as e:
-                error_msg = f"FFmpeg error: {e.stderr}"
-                logger.error(error_msg)
-                raise HTTPException(status_code=500, detail=error_msg)
-            except Exception as e:
-                error_msg = f"Unexpected error: {str(e)}"
-                logger.error(error_msg)
-                raise HTTPException(status_code=500, detail=error_msg)
+                raise HTTPException(status_code=500, detail=f"FFmpeg error: {e.stderr.decode()}")
+
+    @staticmethod
+    async def process_video_with_overlays(video: UploadFile, filters: str, fps: int) -> bytes:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = os.path.join(temp_dir, "input.mp4")
+            output_path = os.path.join(temp_dir, "output.mp4")
+            
+            # Write uploaded file to disk
+            with open(input_path, "wb") as f:
+                f.write(await video.read())
+            
+            try:
+                subprocess.run([
+                    "ffmpeg", "-i", input_path,
+                    "-vf", filters,
+                    "-r", str(fps),
+                    "-c:v", "libx264",
+                    "-preset", "fast",
+                    output_path
+                ], check=True, capture_output=True)
+                
+                with open(output_path, "rb") as f:
+                    return f.read()
+            except subprocess.CalledProcessError as e:
+                raise HTTPException(status_code=500, detail=f"FFmpeg error: {e.stderr.decode()}")
+
+    @staticmethod
+    async def process_video(video: UploadFile, overlays: str, fps: int) -> bytes:
+        overlays_data = json.loads(overlays)
+        
+        # Build FFmpeg filter complex for text overlays
+        filter_complex = []
+        for i, overlay in enumerate(overlays_data):
+            # Convert color from hex to FFmpeg format if needed
+            color = overlay['color'].lstrip('#')
+            bg_color = overlay['backgroundColor'].lstrip('#')
+            
+            # Create drawtext filter for each overlay
+            text_filter = (
+                f"drawtext=text='{overlay['text']}':"
+                f"fontsize={overlay['fontSize']}:"
+                f"fontfile=/path/to/fonts/{overlay['fontFamily']}.ttf:"
+                f"x={overlay['x']}:y={overlay['y']}:"
+                f"fontcolor=0x{color}:"
+                f"box=1:boxcolor=0x{bg_color}"  # Remove the @0.5 here since we handle it in the client
+            )
+            
+            filter_complex.append(text_filter)
+        
+        # Combine all filters
+        filters = ','.join(filter_complex)
+        
+        return await VideoProcessor.process_video_with_overlays(video, filters, fps)
+
+    @staticmethod
+    async def generate_thumbnails(video: UploadFile, num_thumbnails: int = 3) -> bytes:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = os.path.join(temp_dir, "input.mp4")
+            thumbnails_dir = os.path.join(temp_dir, "thumbnails")
+            os.makedirs(thumbnails_dir)
+            
+            # Write uploaded file to disk
+            with open(input_path, "wb") as f:
+                f.write(await video.read())
+            
+            try:
+                # Get video duration
+                duration_cmd = subprocess.run([
+                    "ffprobe", 
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    input_path
+                ], capture_output=True, text=True, check=True)
+                duration = float(duration_cmd.stdout)
+                
+                # Calculate timestamp intervals
+                interval = duration / (num_thumbnails + 1)
+                timestamps = [interval * i for i in range(1, num_thumbnails + 1)]
+                
+                # Generate thumbnails
+                for i, timestamp in enumerate(timestamps):
+                    output_path = os.path.join(thumbnails_dir, f"thumb_{i}.jpg")
+                    subprocess.run([
+                        "ffmpeg",
+                        "-ss", str(timestamp),
+                        "-i", input_path,
+                        "-vf", "scale=320:-1",  # 320px width, maintain aspect ratio
+                        "-vframes", "1",
+                        "-q:v", "2",  # High quality (2-31, lower is better)
+                        output_path
+                    ], check=True, capture_output=True)
+                
+                # Create zip file containing thumbnails
+                zip_buffer = BytesIO()
+                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                    for filename in os.listdir(thumbnails_dir):
+                        file_path = os.path.join(thumbnails_dir, filename)
+                        zip_file.write(file_path, filename)
+                
+                return zip_buffer.getvalue()
+                
+            except subprocess.CalledProcessError as e:
+                raise HTTPException(status_code=500, detail=f"FFmpeg error: {e.stderr.decode()}")
 
 # API endpoints
 @app.post("/concatenate")
@@ -196,22 +282,16 @@ async def get_video_specs(video: UploadFile):
     return await VideoProcessor.get_video_specs(video)
 
 @app.post("/combine-frames")
-async def combine_frames(zip_file: UploadFile, fps: int):
-    logger.info(f"Received combine-frames request: zip_file={zip_file.filename}, fps={fps}")
-    
-    # Input validation
-    if not zip_file.filename.endswith('.zip'):
-        logger.error("File must be a zip archive")
-        raise HTTPException(status_code=400, detail="File must be a zip archive")
-    
-    if fps <= 0:
-        logger.error(f"Invalid fps value: {fps}")
-        raise HTTPException(status_code=400, detail="FPS must be greater than 0")
-    
-    try:
-        result = await VideoProcessor.combine_frames_to_video(zip_file, fps)
-        logger.info("Successfully combined frames into video")
-        return Response(content=result, media_type="video/mp4")
-    except Exception as e:
-        logger.error(f"Error in combine_frames endpoint: {str(e)}")
-        raise 
+async def combine_frames(frames: List[UploadFile], fps: int):
+    result = await VideoProcessor.combine_frames_to_video(frames, fps)
+    return Response(content=result, media_type="video/mp4")
+
+@app.post("/process-video")
+async def process_video(video: UploadFile, overlays: str, fps: int):
+    result = await VideoProcessor.process_video(video, overlays, fps)
+    return Response(content=result, media_type="video/mp4")
+
+@app.post("/generate-thumbnails")
+async def generate_thumbnails(video: UploadFile, num_thumbnails: int = 3):
+    result = await VideoProcessor.generate_thumbnails(video, num_thumbnails)
+    return Response(content=result, media_type="application/zip")
